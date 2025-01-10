@@ -356,7 +356,7 @@ stages:
         name: "test_i2"
         policy:
           actions:
-            - "agent:upgrade"
+            - "agent:read"
           resources:
             - "agent:id:004"
             - "agent:id:005"
@@ -372,7 +372,7 @@ stages:
               name: test_i2
               policy:
                 actions:
-                  - agent:upgrade
+                  - agent:read
                 effect: deny
                 resources:
                   - agent:id:004
@@ -549,7 +549,7 @@ stages:
           actions:
             - "agent:read"
           resources:
-            - "agent:id:000"
+            - "agent:id:001"
           effect: "allow"
     response:
       status_code: 400
@@ -913,13 +913,23 @@ stages:
     response:
       status_code: 400
 
-  - name: Create a new user (invalid username parameter)
+  - name: Create a new user (invalid username parameter, integer)
     request:
       verify: False
       <<: *post_users_request
       json:
         password: "new_user11A"
         username: 1
+    response:
+      status_code: 400
+  
+  - name: Create a new user (invalid username parameter, non-ASCII)
+    request:
+      verify: False
+      <<: *post_users_request
+      json:
+        username: "new_user_啊"
+        password: "new_user"
     response:
       status_code: 400
 

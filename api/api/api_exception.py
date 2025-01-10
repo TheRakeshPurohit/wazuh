@@ -2,8 +2,8 @@
 # Created by Wazuh, Inc. <info@wazuh.com>.
 # This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2
 
-from api.constants import RELATIVE_CONFIG_FILE_PATH, RELATIVE_SECURITY_PATH
-from wazuh.core.exception import DOCU_VERSION
+from connexion.exceptions import ProblemException
+from wazuh.core.exception import WazuhTooManyRequests
 
 
 class APIException(Exception):
@@ -25,13 +25,7 @@ class APIException(Exception):
         self.details = details
         # show relative paths in exceptions
         self.exceptions = {
-            2000: 'Some parameters are not expected in the configuration file '
-                  f"(WAZUH_PATH/{RELATIVE_CONFIG_FILE_PATH}). Please check the documentation for further details: "
-                  f"https://documentation.wazuh.com/{DOCU_VERSION}/user-manual/api/configuration.html"
-                  '#api-configuration-options',
-            2001: 'Error creating or reading secrets file. Please, ensure '
-                  'there is enough disk space and permission to write in '
-                  f'WAZUH_PATH/{RELATIVE_SECURITY_PATH}',
+            2000: 'Some parameters are not expected in the configuration',
             2002: 'Error migrating configuration from old API version. '
                   'Default configuration will be applied',
             2003: 'Error loading SSL/TLS certificates',
@@ -39,8 +33,6 @@ class APIException(Exception):
             2005: 'Body request is not a valid JSON',
             2006: 'Error parsing body request to UTF-8',
             2007: 'Body is empty',
-            2008: 'Experimental features are disabled. '
-                  'It can be changed in the API configuration',
             2009: 'Semicolon (;) is a reserved character and must '
                   'be percent-encoded (%3B) to use it.',
             2010: 'Error while attempting to bind on address: address already in use',
@@ -62,3 +54,27 @@ class APIException(Exception):
 
 class APIError(APIException):
     pass
+
+
+class BlockedIPException(ProblemException):
+    """Bocked IP Exception Class."""
+    def __init__(self, *, status=500, title=None, detail=None):
+        ext = {"code": 6000}
+        super().__init__(status=status, title=title, detail=detail, ext=ext)
+
+
+class MaxRequestsException(ProblemException):
+    """Bocked IP Exception Class."""
+    def __init__(self, code):
+        exc = WazuhTooManyRequests(code=code)
+        ext = {"code": exc.code}
+        ext.update({"remediation": exc.remediation} if hasattr(exc, 'remediation') else {})
+        super().__init__(status=429, title=exc.title, detail=exc.message, type=exc.type, ext=ext)
+
+
+class ExpectFailedException(ProblemException):
+    """Exception for failed expectation (status code 417)."""
+
+    def __init__(self, *, status=417, title=None, detail=None):
+        ext = {"code": 417}
+        super().__init__(status=status, title=title, detail=detail, ext=ext)
