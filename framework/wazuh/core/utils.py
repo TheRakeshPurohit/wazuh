@@ -3,33 +3,29 @@
 # This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
 
 import errno
-import glob
 import hashlib
 import json
 import operator
 import os
+import psutil
 import re
 import stat
 import sys
-import tempfile
 import typing
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from itertools import groupby, chain
-from os import chmod, chown, listdir, mkdir, curdir, rename, utime, remove, walk, path
-from pyexpat import ExpatError
-from shutil import Error, move, copy2
+from os import chmod, chown, listdir, mkdir, curdir, rename, utime, path
+from pathlib import Path
+from shutil import move, copy2
 from signal import signal, alarm, SIGALRM, SIGKILL
 
+import yaml
 from cachetools import cached, TTLCache
-from defusedxml.ElementTree import fromstring
-from defusedxml.minidom import parseString
 
-import wazuh.core.results as results
-from api import configuration
+import server_management_api.configuration
 from wazuh.core import common
-from wazuh.core.database import Connection
 from wazuh.core.exception import WazuhError, WazuhInternalError
 from wazuh.core.wdb import WazuhDBConnection
 
@@ -40,9 +36,40 @@ if sys.version_info[0] == 3:
 # Temporary cache
 t_cache = TTLCache(maxsize=4500, ttl=60)
 
+GROUP_FILE_EXT = '.yml'
 
-def clean_pid_files(daemon: str):
-    """Check the existence of '.pid' files for a specified daemon.
+
+def create_wazuh_dir(dirpath: Path):
+    """Create a directory if it doesn't exist and assign ownership.
+
+    Parameters
+    ----------
+    dirpath : Path
+        Directory to create.
+    """
+    if not dirpath.exists():
+        dirpath.mkdir()
+        chown(dirpath, common.wazuh_uid(), common.wazuh_gid())
+
+
+def assign_wazuh_ownership(filepath: str):
+    """Create a file if it doesn't exist and assign ownership.
+
+    Parameters
+    ----------
+    filepath : str
+        File to assign ownership.
+    """
+    if not os.path.isfile(filepath):
+        f = open(filepath, "w")
+        f.close()
+    if os.stat(filepath).st_gid != common.wazuh_gid() or \
+        os.stat(filepath).st_uid != common.wazuh_uid():
+        os.chown(filepath, common.wazuh_uid(), common.wazuh_gid())
+
+
+def clean_pid_files(daemon: str) -> None:
+    """Clean the '.pid' files for a specified daemon and kill their process group.
 
     Parameters
     ----------
@@ -50,15 +77,25 @@ def clean_pid_files(daemon: str):
         Daemon's name.
     """
     regex = rf'{daemon}[\w_]*-(\d+).pid'
-    for pid_file in os.listdir(common.OSSEC_PIDFILE_PATH):
+    for pid_file in os.listdir(common.WAZUH_RUN):
         if match := re.match(regex, pid_file):
             try:
-                os.kill(int(match.group(1)), SIGKILL)
-                print(f"{daemon}: Orphan child process {match.group(1)} was terminated.")
-            except OSError:
-                print(f'{daemon}: Non existent process {match.group(1)}, removing from {common.WAZUH_PATH}/var/run...')
+                pid = int(match.group(1))
+                process = psutil.Process(pid)
+                command = process.cmdline()[-1] if process.status() != psutil.STATUS_ZOMBIE \
+                    else daemon.replace('-', '_')
+
+                if daemon.replace('-', '_') in command:
+                    pgid = os.getpgid(pid)
+                    os.killpg(pgid, SIGKILL)
+                    print(f"{daemon}: Orphan child process {pid} was terminated.")
+                else:
+                    print(f"{daemon}: Process {pid} does not belong to {daemon}, removing from {common.WAZUH_RUN}...")
+
+            except (OSError, psutil.NoSuchProcess):
+                print(f'{daemon}: Non existent process {pid}, removing from {common.WAZUH_RUN}...')
             finally:
-                os.remove(path.join(common.OSSEC_PIDFILE_PATH, pid_file))
+                os.remove(path.join(common.WAZUH_RUN, pid_file))
 
 
 def find_nth(string: str, substring: str, n: int) -> int:
@@ -112,7 +149,7 @@ def process_array(array: list, search_text: str = None, complementary_search: bo
                   search_in_fields: list = None, select: list = None, sort_by: list = None,
                   sort_ascending: bool = True, allowed_sort_fields: list = None, offset: int = 0, limit: int = None,
                   q: str = '', required_fields: list = None, allowed_select_fields: list = None,
-                  filters: dict = None) -> dict:
+                  filters: dict = None, distinct: bool = False) -> dict:
     """Process a Wazuh framework data array.
 
     Parameters
@@ -145,6 +182,8 @@ def process_array(array: list, search_text: str = None, complementary_search: bo
         List of fields allowed to select from.
     filters : dict
         Defines required field filters. Format: {"field1":"value1", "field2":["value2","value3"]}
+    distinct : bool
+        Look for distinct values.
 
     Returns
     -------
@@ -152,14 +191,15 @@ def process_array(array: list, search_text: str = None, complementary_search: bo
         Dictionary: {'items': Processed array, 'totalItems': Number of items, before applying offset and limit)}
     """
     if not array:
-        return {'items': list(), 'totalItems': 0}
+        return {'items': [], 'totalItems': 0}
 
     if isinstance(filters, dict) and len(filters.keys()) > 0:
-        new_array = list()
+        new_array = []
         for element in array:
             for key, value in filters.items():
                 if element[key] in value:
                     new_array.append(element)
+                    break
 
         array = new_array
 
@@ -177,8 +217,18 @@ def process_array(array: list, search_text: str = None, complementary_search: bo
         array = filter_array_by_query(q, array)
 
     if select:
+        # Do not force the inclusion of any fields when we are looking for distinct values
+        required_fields = set() if distinct else required_fields
         array = select_array(array, select=select, required_fields=required_fields,
                              allowed_select_fields=allowed_select_fields)
+
+    if distinct:
+        distinct_array = []
+        for element in array:
+            if element not in distinct_array:
+                distinct_array.append(element)
+
+        array = distinct_array
 
     return {'items': cut_array(array, offset=offset, limit=limit), 'totalItems': len(array)}
 
@@ -336,7 +386,7 @@ def get_values(o: object, fields: list = None) -> list:
     strings = []
 
     try:
-        obj = o.to_dict()  # Rule, Decoder, Agent...
+        obj = o.to_dict()  # Agent...
     except:
         obj = o
 
@@ -612,39 +662,6 @@ def chown_r(file_path: str, uid: int, gid: int):
                 chown_r(item_path, uid, gid)
 
 
-def delete_wazuh_file(full_path: str) -> bool:
-    """Delete a Wazuh file.
-
-    Parameters
-    ----------
-    full_path : str
-        Full path of the file to delete.
-
-    Raises
-    ------
-    WazuhError(1906)
-        File does not exist.
-    WazuhError(1907)
-        File could not be deleted.
-
-    Returns
-    -------
-    bool
-        True if success.
-    """
-    if not full_path.startswith(common.WAZUH_PATH) or '..' in full_path:
-        raise WazuhError(1907)
-
-    if path.exists(full_path):
-        try:
-            remove(full_path)
-            return True
-        except IOError:
-            raise WazuhError(1907)
-    else:
-        raise WazuhError(1906)
-
-
 def safe_move(source: str, target: str, ownership: tuple = None, time: tuple = None, permissions: int = None):
     """Move a file even between filesystems
 
@@ -840,103 +857,70 @@ def plain_dict_to_nested_dict(data, nested=None, non_nested=None, force_fields=[
     return nested_dict
 
 
-def check_remote_commands(data: str):
-    """Check if remote commands are allowed. If not, it will check if the found command is in the list of exceptions.
+def validate_wazuh_configuration(data: str):
+    """Check that the Wazuh configuration provided is valid.
 
     Parameters
     ----------
     data : str
-        Configuration file
+        Configuration content.
     """
-    blocked_configurations = configuration.api_conf['upload_configuration']
-
-    def check_section(command_regex, section, split_section):
-        try:
-            for line in command_regex.findall(data)[0].split(split_section):
-                command_matches = re.match(r".*<(command|full_command)>(.*)</(command|full_command)>.*",
-                                           line, flags=re.MULTILINE | re.DOTALL)
-                if command_matches and \
-                        (line.count('<command>') > 1 or
-                         command_matches.group(2) not in
-                         blocked_configurations['remote_commands'][section].get('exceptions', [])):
-                    raise WazuhError(1124)
-        except IndexError:
-            pass
-
-    if not blocked_configurations['remote_commands']['localfile']['allow']:
-        command_section = re.compile(r"<localfile>(.*)</localfile>", flags=re.MULTILINE | re.DOTALL)
-        check_section(command_section, section='localfile', split_section='</localfile>')
-
-    if not blocked_configurations['remote_commands']['wodle_command']['allow']:
-        command_section = re.compile(r"<wodle name=\"command\">(.*)</wodle>", flags=re.MULTILINE | re.DOTALL)
-        check_section(command_section, section='wodle_command', split_section='<wodle name=\"command\">')
+    # TODO(#25121): Validate configuration
 
 
-def check_disabled_limits_in_conf(data):
-    """Check if Wazuh limits are allowed.
+def load_wazuh_yaml(filepath: str, data: str = None) -> dict:
+    """Load Wazuh YAML configuration files.
 
     Parameters
     ----------
+    filepath : str
+        File path.
     data : str
-        Configuration file.
+        YAML formatted string.
 
     Raises
+    ------
+    WazuhError(1006)
+        File does not exist or lack of permissions.
+    WazuhError(1132)
+        Invalid YAML syntax.
+
+    Returns
     -------
-    WazuhError(1127)
-        Raised if one of the disabled limits is present in the configuration to upload.
+    dict
+        Dictionary with the content.
     """
-    def check_section(section_name):
-        if re.findall(pattern=r'<global>.*<limits>.*<{0}>.*</{0}>.*</limits>.*</global>'.format(section_name),
-                      string=data, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE):
-            raise WazuhError(1127, extra_message=f"global > limits > {section_name}")
-
-    blocked_configurations = configuration.api_conf['upload_configuration']
-    for disabled_limit in [conf for conf, allowed in blocked_configurations['limits'].items() if not allowed['allow']]:
-        check_section(disabled_limit)
-
-
-def load_wazuh_xml(xml_path, data=None):
     if not data:
-        with open(xml_path) as f:
-            data = f.read()
+        try:
+            with open(filepath) as f:
+                data = f.read()
+        except Exception as e:
+            raise WazuhError(1006, extra_message=str(e))
 
-    # -- characters are not allowed in XML comments
-    xml_comment = re.compile(r"(<!--(.*?)-->)", flags=re.MULTILINE | re.DOTALL)
-    for comment in xml_comment.finditer(data):
-        good_comment = comment.group(2).replace('--', '..')
-        data = data.replace(comment.group(2), good_comment)
+    validate_wazuh_configuration(data)
 
-    # Replace &lt; and &gt; currently present in the config
-    data = data.replace('&lt;', '_custom_amp_lt_').replace('&gt;', '_custom_amp_gt_')
+    try:
+        parsed_data = yaml.safe_load(data)
+    except yaml.YAMLError as e:
+        raise WazuhError(1132, extra_message=str(e))
 
-    custom_entities = {
-        'backslash': '\\'
-    }
+    return parsed_data
 
-    # replace every custom entity
-    for character, replacement in custom_entities.items():
-        data = re.sub(replacement.replace('\\', '\\\\'), f'&{character};', data)
 
-    # < characters should be escaped as &lt; unless < is starting a <tag> or a comment
-    data = re.sub(r"<(?!/?\w+.+>|!--)", "&lt;", data)
+def get_group_file_path(group_id: str) -> str:
+    """Returns the path to the group configuration file.
 
-    # replace \< by &lt, only outside xml tags;
-    data = re.sub(r'^&backslash;<(.*[^>])$', '&backslash;&lt;\g<1>', data)
+    Parameters
+    ----------
+    group_id : str
+        Group ID.
 
-    # replace \> by &gt;
-    data = re.sub(r'&backslash;>', '&backslash;&gt;', data)
-
-    # default entities
-    default_entities = ['amp', 'lt', 'gt', 'apos', 'quot']
-
-    # & characters should be escaped if they don't represent an &entity;
-    data = re.sub(f"&(?!({'|'.join(default_entities + list(custom_entities))});)", "&amp;", data)
-
-    entities = '<!DOCTYPE xmlfile [\n' + \
-               '\n'.join([f'<!ENTITY {name} "{value}">' for name, value in custom_entities.items()]) + \
-               '\n]>\n'
-
-    return fromstring(f"{entities}<root_tag>{data}</root_tag>", forbid_entities=False)
+    Returns
+    -------
+    str
+        Group configuration file path.
+    """
+    return path.join(common.WAZUH_GROUPS, group_id+GROUP_FILE_EXT)
 
 
 class WazuhVersion:
@@ -1165,7 +1149,22 @@ def filter_array_by_query(q: str, input_array: typing.List) -> typing.List:
 
     # compile regular expression only one time when function is called
     # get elements in a clause
-    re_get_elements = re.compile(r'([\w\-]+)(?:\.?)((?:[\w\-](?:\.[\w\-])*)*)(=|!=|<|>|~)([\w\-./: ]+)')
+    operators = ['=', '!=', '<', '>', '~']
+    re_get_elements = re.compile(
+        r"\(?" +
+        # Field name: name of the field to look on DB.
+        r"([\w]+)" +
+        # New capturing group for text after the first dot.
+        r"\.?([\w.]*)?" +
+        # Operator: looks for '=', '!=', '<', '>' or '~'.
+        rf"([{''.join(operators)}]{{1,2}})" +
+        # Value: A string.
+        r"((?:(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}]*)\))*"
+        r"(?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}]+)"
+        r"(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}]*)\))*)+)" +
+        r"\)?"
+    )
+
     # get a list with OR clauses
     or_clauses = q.split(',')
     output_array = []
@@ -1266,11 +1265,7 @@ class WazuhDBBackend(AbstractDatabaseBackend):
 
     def _render_query(self, query):
         """Render query attending the format."""
-        if self.query_format == 'mitre':
-            return f'mitre sql {query}'
-        elif self.query_format == 'task':
-            return f'task sql {query}'
-        elif self.query_format == 'global':
+        if self.query_format == 'global':
             return f'global sql {query}'
         else:
             return f'agent {self.agent_id} sql {query}'
@@ -1347,7 +1342,8 @@ class WazuhDBQuery(object):
         self.count = count
         self.data = get_data
         self.total_items = 0
-        self.min_select_fields = min_select_fields
+        # Do not include any fields when we are looking for distinct values
+        self.min_select_fields = set() if distinct else min_select_fields
         self.query_operators = {"=": "=", "!=": "!=", "<": "<", ">": ">", "~": 'LIKE'}
         self.query_separators = {',': 'OR', ';': 'AND', '': ''}
         self.special_characters = "\'\""
@@ -1358,22 +1354,21 @@ class WazuhDBQuery(object):
         #    id   > 5      ),
         #    group=webserver
         self.query_regex = re.compile(
-            # A ( character.
-            r"(\()?" +
+            # One or more ( characters.
+            r"(\(+)?" +
             # Field name: name of the field to look on DB.
             r"([\w.]+)" +
             # Operator: looks for '=', '!=', '<', '>' or '~'.
             rf"([{''.join(self.query_operators.keys())}]{{1,2}})" +
             # Value: A string.
-            r"((?:(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}]*)\))*"
-            r"(?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}]+)"
-            r"(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}]*)\))*)+)" +
-            # A ) character.
-            r"(\))?" +
+            r"((?:(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}$]*)\))*"
+            r"(?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}$]+)"
+            r"(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}$]*)\))*)+)"
+            # One or more ) characters.
+            r"(\)+)?" +
             # Separator: looks for ';', ',' or nothing.
             rf"([{''.join(self.query_separators.keys())}])?"
         )
-        self.date_regex = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
         self.date_fields = date_fields
         self.extra_fields = extra_fields
         self.q = query
@@ -1484,11 +1479,11 @@ class WazuhDBQuery(object):
                                                                                  operator))
 
             if open_level:
-                level += 1
+                level += len(open_level)
             if close_level:
-                level -= 1
+                level -= len(close_level)
 
-            if not self._pass_filter(value):
+            if not self._pass_filter(field, value):
                 op_index = len(list(filter(lambda x: field in x['field'], self.query_filters)))
                 self.query_filters.append({'value': None if value == "null" else value,
                                            'operator': self.query_operators[operator],
@@ -1518,7 +1513,7 @@ class WazuhDBQuery(object):
                                 'separator': 'AND' if len(value) <= 1 or len(value) == i + 1 else 'OR',
                                 'level': 0 if i == len(value) - 1 else 1}
                                for name, value in legacy_filters_as_list.items()
-                               for i, subvalue in enumerate(value) if not self._pass_filter(subvalue)]
+                               for i, subvalue in enumerate(value) if not self._pass_filter(name, subvalue)]
 
         if self.query_filters:
             # if only traditional filters have been defined, remove last AND from the query.
@@ -1556,18 +1551,30 @@ class WazuhDBQuery(object):
 
     def _add_filters_to_query(self):
         self._parse_filters()
+
         curr_level = 0
         for q_filter in self.query_filters:
             self._clean_filter(q_filter)
             field_name = q_filter['field'].split('$', 1)[0]
             field_filter = q_filter['field'].replace('.', '_')
+            level = q_filter['level']
 
-            self.query += '((' if curr_level < q_filter['level'] else '('
+            repeat_open = level + 1 - curr_level
+            if level == 0 or repeat_open == 0:
+                repeat_open = 1
+
+            self.query += '(' * repeat_open
 
             self._process_filter(field_name, field_filter, q_filter)
 
-            self.query += ('))' if curr_level > q_filter['level'] else ')') + ' {} '.format(q_filter['separator'])
-            curr_level = q_filter['level']
+            repeat_close = 1
+            if curr_level > level:
+                repeat_close += curr_level - level
+
+            self.query += ')' * repeat_close
+            self.query += ' {} '.format(q_filter['separator'])
+            curr_level = level
+
         if self.distinct:
             self.query += ' WHERE ' if not self.q and 'WHERE' not in self.query else ' AND '
             self.query += ' AND '.join(
@@ -1726,8 +1733,9 @@ class WazuhDBQuery(object):
         return "SELECT COUNT(*) FROM ({0})"
 
     @staticmethod
-    def _pass_filter(db_filter):
-        return db_filter == "all"
+    def _pass_filter(field, value):
+        # field is used by child classes containing a field that may have a value equal to 'all'
+        return value == "all"
 
 
 class WazuhDBQueryDistinct(WazuhDBQuery):
@@ -1779,252 +1787,6 @@ class WazuhDBQueryGroupBy(WazuhDBQuery):
                 'fields': set(self.filter_fields)
             }
         self.select = self.select & self.filter_fields['fields']
-
-
-@common.context_cached('system_rules')
-def expand_rules() -> set:
-    """Return all ruleset rule files in the system.
-
-    Returns
-    -------
-    set
-        Rule files.
-    """
-    folders = [common.RULES_PATH, common.USER_RULES_PATH]
-    rules = set()
-    for folder in folders:
-        for _, _, files in walk(folder):
-            for f in filter(lambda x: x.endswith(common.RULES_EXTENSION), files):
-                rules.add(f)
-
-    return rules
-
-
-@common.context_cached('system_decoders')
-def expand_decoders() -> set:
-    """Return all ruleset decoder files in the system.
-
-    Returns
-    -------
-    set
-        Decoder files.
-    """
-    folders = [common.DECODERS_PATH, common.USER_DECODERS_PATH]
-    decoders = set()
-    for folder in folders:
-        for _, _, files in walk(folder):
-            for f in filter(lambda x: x.endswith(common.DECODERS_EXTENSION), files):
-                decoders.add(f)
-
-    return decoders
-
-
-@common.context_cached('system_lists')
-def expand_lists() -> set:
-    """Return all cdb list files in the system.
-
-    Returns
-    -------
-    set
-        CDB list files.
-    """
-    folders = [common.LISTS_PATH, common.USER_LISTS_PATH]
-    lists = set()
-    for folder in folders:
-        for _, _, files in walk(folder):
-            for f in filter(lambda x: x.endswith(common.LISTS_EXTENSION), files):
-                # List files do not have an extension at the moment
-                if '.' not in f:
-                    lists.add(f)
-
-    return lists
-
-
-def add_dynamic_detail(detail: str, value: str, attribs: dict, details: dict):
-    """Add a detail with attributes (i.e. regex with negate or type).
-
-    Parameters
-    ----------
-    detail : str
-        Name of the detail.
-    value : str
-        Detail value.
-    attribs : dict
-        Dictionary with the XML attributes.
-    details : dict
-        Dictionary with all the current details.
-    """
-    if detail in details:
-        new_pattern = details[detail]['pattern'] + value
-        details[detail].clear()
-        details[detail]['pattern'] = new_pattern
-    else:
-        details[detail] = dict()
-        details[detail]['pattern'] = value
-
-    details[detail].update(attribs)
-
-
-def validate_wazuh_xml(content: str, config_file: bool = False):
-    """Validate Wazuh XML files (rules, decoders and ossec.conf)
-
-    Parameters
-    ----------
-    content : str
-        File content.
-    config_file : bool
-        Validate remote commands if True.
-
-    Raises
-    ------
-    WazuhError(1113)
-        XML syntax error.
-    """
-    # -- characters are not allowed in XML comments
-    content = replace_in_comments(content, '--', '%wildcard%')
-
-    # Create temporary file for parsing xml input
-    try:
-        # Beautify xml file and escape '&' character as it could come in some tag values unescaped
-        xml = parseString(f'<root>{content}</root>'.replace('&', '&amp;'))
-        # Remove first line (XML specification: <? xmlversion="1.0" ?>), <root> and </root> tags, and empty lines
-        indent = '  '  # indent parameter for toprettyxml function
-        pretty_xml = '\n'.join(filter(lambda x: x.strip(), xml.toprettyxml(indent=indent).split('\n')[2:-2])) + '\n'
-        # Revert xml.dom replacings
-        # (https://github.com/python/cpython/blob/8e0418688906206fe59bd26344320c0fc026849e/Lib/xml/dom/minidom.py#L305)
-        pretty_xml = pretty_xml.replace("&amp;", "&").replace("&lt;", "<").replace("&quot;", "\"", ) \
-            .replace("&gt;", ">").replace('&apos;', "'")
-        # Delete two first spaces of each line
-        final_xml = re.sub(fr'^{indent}', '', pretty_xml, flags=re.MULTILINE)
-        final_xml = replace_in_comments(final_xml, '%wildcard%', '--')
-
-        # Check if remote commands are allowed if it is a configuration file
-        if config_file:
-            check_remote_commands(final_xml)
-            check_disabled_limits_in_conf(final_xml)
-        # Check xml format
-        load_wazuh_xml(xml_path='', data=final_xml)
-    except ExpatError:
-        raise WazuhError(1113)
-    except WazuhError as e:
-        raise e
-    except Exception as e:
-        raise WazuhError(1113, str(e))
-
-
-def upload_file(content: str, file_path: str, check_xml_formula_values: bool = True):
-    """Upload files (rules, lists, decoders and ossec.conf).
-
-    Parameters
-    ----------
-    content: str
-        Content of the XML file.
-    file_path: str
-        Destination of the new XML file.
-    check_xml_formula_values: bool
-        Check formula values in the resulting XML if true.
-
-    Raises
-    ------
-    WazuhInternalError(1005)
-        Error reading file.
-    WazuhInternalError(1016)
-        Error moving file.
-
-    Returns
-    -------
-    WazuhResult
-        Confirmation message.
-    """
-
-    def escape_formula_values(xml_string):
-        """Prepend with a single quote possible formula injections."""
-        formula_characters = ('=', '+', '-', '@')
-        et = fromstring(f'<root>{xml_string}</root>')
-        full_preprend, beginning_preprend = list(), list()
-        for node in et.iter():
-            if node.tag and node.tag.startswith(formula_characters):
-                full_preprend.append(node.tag)
-            if node.text and node.text.startswith(formula_characters) and ("'" in node.text or '"' in node.text):
-                beginning_preprend.append(node.text)
-
-        for text in full_preprend:
-            xml_string = re.sub(f'<{re.escape(text)}>', f"<'{text}'>", xml_string)
-            xml_string = re.sub(f'</{re.escape(text)}>', f"</'{text}'>", xml_string)
-
-        for text in beginning_preprend:
-            xml_string = re.sub(f'>{re.escape(text)}<', f">'{text}<", xml_string)
-
-        return xml_string
-
-    # Path of temporary files for parsing xml input
-    handle, tmp_file_path = tempfile.mkstemp(prefix='api_tmp_file_', suffix='.tmp', dir=common.OSSEC_TMP_PATH)
-    try:
-        with open(handle, 'w') as tmp_file:
-            final_file = escape_formula_values(content) if check_xml_formula_values else content
-            tmp_file.write(final_file)
-        chmod(tmp_file_path, 0o660)
-    except IOError:
-        raise WazuhInternalError(1005)
-
-    # Move temporary file to group folder
-    try:
-        new_conf_path = path.join(common.WAZUH_PATH, file_path)
-        safe_move(tmp_file_path, new_conf_path, ownership=(common.wazuh_uid(), common.wazuh_gid()), permissions=0o660)
-    except Error:
-        raise WazuhInternalError(1016)
-
-    return results.WazuhResult({'message': 'File was successfully updated'})
-
-
-def delete_file_with_backup(backup_file: str, abs_path: str, delete_function: callable):
-    """Try to delete a file doing a backup beforehand.
-
-    Parameters
-    ----------
-    backup_file : str
-        Name of the backup file.
-    abs_path : str
-        Absolute path of the file to delete.
-    delete_function : callable
-        Function that will be used to delete the file.
-
-    Raises
-    ------
-    WazuhError(1019)
-        If there is any `IOError` while doing the backup.
-    """
-    try:
-        full_copy(abs_path, backup_file)
-    except IOError:
-        raise WazuhError(1019)
-    delete_function(filename=path.basename(abs_path))
-
-
-def replace_in_comments(original_content, to_be_replaced, replacement):
-    xml_comment = re.compile(r"(<!--(.*?)-->)", flags=re.MULTILINE | re.DOTALL)
-    for comment in xml_comment.finditer(original_content):
-        good_comment = comment.group(2).replace(to_be_replaced, replacement)
-        original_content = original_content.replace(comment.group(2), good_comment)
-    return original_content
-
-
-def to_relative_path(full_path: str, prefix: str = common.WAZUH_PATH) -> str:
-    """Return a relative path from the Wazuh base directory.
-
-    Parameters
-    ----------
-    full_path : str
-        Absolute path.
-    prefix : str, opt
-        Prefix to strip from the absolute path. Default `common.WAZUH_PATH`
-
-    Returns
-    -------
-    str
-        Relative path to `full_path` from `prefix`.
-    """
-    return path.relpath(full_path, prefix)
 
 
 def clear_temporary_caches():
@@ -2112,7 +1874,7 @@ def get_date_from_timestamp(timestamp: float) -> datetime:
     date: datetime
         The default date.
     """
-    return datetime.utcfromtimestamp(timestamp).replace(tzinfo=timezone.utc)
+    return datetime.fromtimestamp(timestamp, timezone.utc)
 
 
 def get_utc_now() -> datetime:
@@ -2123,7 +1885,7 @@ def get_utc_now() -> datetime:
     date: datetime
         The current date.
     """
-    return datetime.utcnow().replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
 
 
 def get_utc_strptime(date: str, datetime_format: str) -> datetime:
